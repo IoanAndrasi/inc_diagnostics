@@ -11,10 +11,10 @@
  * SPDX-License-Identifier: Apache-2.0
  ********************************************************************************/
 
-use diag_api::sovd::app_registration::{
-    AppRegistrar, DeregisterAppArgs, RegisterAppArgs, RegisterAppReply,
-};
 use diag_api::sovd;
+use diag_api::sovd::app_registration::{
+    DeregisterEntityArgs, EntityRegistrar, RegisterEntityArgs, RegisterEntityReply,
+};
 use diag_api::Error as DiagError;
 use diag_api::Result as DiagResult;
 
@@ -42,27 +42,35 @@ impl OpenSovdRegistrar {
         self.base_url.join_path("register")
     }
 
-    fn deregister_path(&self, app_id: &str) -> String {
-        self.base_url.join_path(&format!("register/{app_id}"))
+    fn deregister_path(&self, entity_id: &str) -> String {
+        self.base_url.join_path(&format!("register/{entity_id}"))
     }
 }
 
-impl AppRegistrar for OpenSovdRegistrar {
-    fn register_app(&self, args: RegisterAppArgs) -> BoxFuture<'_, DiagResult<RegisterAppReply>> {
+impl EntityRegistrar for OpenSovdRegistrar {
+    fn register_entity(
+        &self,
+        args: RegisterEntityArgs,
+    ) -> BoxFuture<'_, DiagResult<RegisterEntityReply>> {
         async move {
             let endpoint = HttpUrl::parse(&args.endpoint).map_err(|_| {
-                invalid_request(format!("invalid app endpoint '{}'", args.endpoint))
+                invalid_request(format!("invalid entity endpoint '{}'", args.endpoint))
             })?;
 
+            let hosting_component = args.hosting_component.clone().ok_or_else(|| {
+                invalid_request(
+                    "hosting_component is required for OpenSOVD registration".to_string(),
+                )
+            })?;
             let response = send_http_request(
                 &self.base_url,
                 "POST",
                 &self.register_path(),
                 Some(
                     json!({
-                        "app_id": args.app_id,
-                        "app_name": args.app_name,
-                        "hosted_on": args.hosted_on,
+                        "app_id": args.entity_id,
+                        "app_name": args.entity_name,
+                        "hosted_on": hosting_component,
                         "port": endpoint.port,
                     })
                     .to_string(),
@@ -81,12 +89,12 @@ impl AppRegistrar for OpenSovdRegistrar {
         .boxed()
     }
 
-    fn deregister_app(&self, args: DeregisterAppArgs) -> BoxFuture<'_, DiagResult<()>> {
+    fn deregister_entity(&self, args: DeregisterEntityArgs) -> BoxFuture<'_, DiagResult<()>> {
         async move {
             let response = send_http_request(
                 &self.base_url,
                 "DELETE",
-                &self.deregister_path(&args.app_id),
+                &self.deregister_path(&args.entity_id),
                 None,
             )?;
 
@@ -103,16 +111,16 @@ impl AppRegistrar for OpenSovdRegistrar {
     }
 }
 
-fn parse_register_reply(response_body: &str) -> RegisterAppReply {
+fn parse_register_reply(response_body: &str) -> RegisterEntityReply {
     if response_body.trim().is_empty() {
-        return RegisterAppReply::default();
+        return RegisterEntityReply::default();
     }
 
     let Ok(value) = serde_json::from_str::<Value>(response_body) else {
-        return RegisterAppReply::default();
+        return RegisterEntityReply::default();
     };
 
-    RegisterAppReply {
+    RegisterEntityReply {
         registration_id: value
             .get("registration_id")
             .and_then(Value::as_str)
@@ -161,9 +169,9 @@ impl HttpUrl {
             None => (rest, "/".to_string()),
         };
 
-        let (host, port) = authority.rsplit_once(':').ok_or_else(|| {
-            invalid_request("URL must include host and port".to_string())
-        })?;
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| invalid_request("URL must include host and port".to_string()))?;
 
         if host.is_empty() {
             return Err(invalid_request("URL host must not be empty".to_string()));
@@ -274,22 +282,25 @@ mod tests {
 
         match err.code {
             diag_api::ErrorCode::SOVD(inner) => {
-                assert_eq!(inner.sovd_error, sovd::ErrorCode::IncompleteRequest.to_string());
+                assert_eq!(
+                    inner.sovd_error,
+                    sovd::ErrorCode::IncompleteRequest.to_string()
+                );
             }
             _ => panic!("expected SOVD error code"),
         }
     }
 
     #[tokio::test]
-    async fn register_app_rejects_invalid_endpoint() {
-        let registrar = OpenSovdRegistrar::new("http://127.0.0.1:7790/api")
-            .expect("base URL should be valid");
+    async fn register_entity_rejects_invalid_endpoint() {
+        let registrar =
+            OpenSovdRegistrar::new("http://127.0.0.1:7790/api").expect("base URL should be valid");
 
         let err = registrar
-            .register_app(RegisterAppArgs {
-                app_id: "APP01".to_string(),
-                app_name: "Diagnostics App".to_string(),
-                hosted_on: "HPC".to_string(),
+            .register_entity(RegisterEntityArgs {
+                entity_id: "APP01".to_string(),
+                entity_name: "Diagnostics App".to_string(),
+                hosting_component: Some("HPC".to_string()),
                 endpoint: "not-a-url".to_string(),
                 additional_attrs: None,
             })
@@ -298,24 +309,27 @@ mod tests {
 
         match err.code {
             diag_api::ErrorCode::SOVD(inner) => {
-                assert_eq!(inner.sovd_error, sovd::ErrorCode::IncompleteRequest.to_string());
+                assert_eq!(
+                    inner.sovd_error,
+                    sovd::ErrorCode::IncompleteRequest.to_string()
+                );
             }
             _ => panic!("expected SOVD error code"),
         }
     }
 
     #[tokio::test]
-    async fn register_app_posts_to_register_endpoint() {
+    async fn register_entity_posts_to_register_endpoint() {
         let (base_url, request_handle) = spawn_test_server(
             "HTTP/1.1 200 OK\r\nContent-Length: 44\r\nContent-Type: application/json\r\n\r\n{\"registration_id\":\"reg-7\",\"lease_ms\":5000}",
         );
         let registrar = OpenSovdRegistrar::new(base_url).expect("base URL should be valid");
 
         let reply = registrar
-            .register_app(RegisterAppArgs {
-                app_id: "APP01".to_string(),
-                app_name: "Diagnostics App".to_string(),
-                hosted_on: "HPC".to_string(),
+            .register_entity(RegisterEntityArgs {
+                entity_id: "APP01".to_string(),
+                entity_name: "Diagnostics App".to_string(),
+                hosting_component: Some("HPC".to_string()),
                 endpoint: "http://127.0.0.1:8081/api".to_string(),
                 additional_attrs: None,
             })
@@ -336,15 +350,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deregister_app_sends_delete_request() {
-        let (base_url, request_handle) = spawn_test_server(
-            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
-        );
+    async fn deregister_entity_sends_delete_request() {
+        let (base_url, request_handle) =
+            spawn_test_server("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
         let registrar = OpenSovdRegistrar::new(base_url).expect("base URL should be valid");
 
         registrar
-            .deregister_app(DeregisterAppArgs {
-                app_id: "APP02".to_string(),
+            .deregister_entity(DeregisterEntityArgs {
+                entity_id: "APP02".to_string(),
                 registration_id: None,
             })
             .await
@@ -358,10 +371,14 @@ mod tests {
 
     fn spawn_test_server(response: &'static str) -> (String, thread::JoinHandle<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have local addr");
+        let address = listener
+            .local_addr()
+            .expect("listener should have local addr");
 
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("server should accept one connection");
+            let (mut stream, _) = listener
+                .accept()
+                .expect("server should accept one connection");
             let mut buffer = Vec::new();
             let mut temp = [0_u8; 4096];
             let mut header_end = None;
@@ -390,7 +407,9 @@ mod tests {
                 .unwrap_or(0);
 
             while buffer.len() < header_end + content_length {
-                let read = stream.read(&mut temp).expect("request body should be readable");
+                let read = stream
+                    .read(&mut temp)
+                    .expect("request body should be readable");
                 buffer.extend_from_slice(&temp[..read]);
             }
 

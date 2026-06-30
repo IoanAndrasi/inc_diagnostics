@@ -11,15 +11,16 @@
  * SPDX-License-Identifier: Apache-2.0
  ********************************************************************************/
 
+use diag_api::sovd::app_registration::{
+    DeregisterEntityArgs, EntityRegistrar, EntityRegistryQuery, RegisterEntityArgs,
+    RegisterEntityReply,
+};
 use diag_api::sovd::data_resource::{
     DataResource, DataResourceMetadata, ReadValueArgs, ReadValueReply,
 };
 use diag_api::sovd::operation::{
     ExecuteArguments, ExecutionControl, ExecutionControlApi, ExecutionEvent, ExecutionEventKind,
     ExecutionResult, ExecutionStatus, Operation, OperationMetadata,
-};
-use diag_api::sovd::app_registration::{
-    AppRegistrar, AppRegistryQuery, DeregisterAppArgs, RegisterAppArgs, RegisterAppReply,
 };
 use diag_api::Error as DiagError;
 use diag_api::Result as DiagResult;
@@ -191,8 +192,11 @@ pub struct Runtime {
     inner: Arc<Mutex<RuntimeImpl>>,
 }
 
-#[derive(Clone, Debug)]
-struct RegisteredApp {
+pub struct RegisteredEntity {
+    pub entity: Arc<Entity>,
+    pub registration: RegisterEntityReply,
+}
+struct RegisteredEntityEndpoint {
     endpoint: String,
     registration_id: Option<String>,
 }
@@ -204,9 +208,13 @@ impl Runtime {
         }
     }
 
-    pub fn with_registrar_backend(registrar_backend: Arc<dyn AppRegistrar + Send + Sync>) -> Self {
+    pub fn with_registrar_backend(
+        registrar_backend: Arc<dyn EntityRegistrar + Send + Sync>,
+    ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RuntimeImpl::with_registrar_backend(registrar_backend))),
+            inner: Arc::new(Mutex::new(RuntimeImpl::with_registrar_backend(
+                registrar_backend,
+            ))),
         }
     }
 
@@ -217,6 +225,17 @@ impl Runtime {
             .get_or_create_entity(id)
     }
 
+    pub async fn register_entity_facade(
+        &self,
+        args: RegisterEntityArgs,
+    ) -> DiagResult<RegisteredEntity> {
+        let registration = EntityRegistrar::register_entity(self, args.clone()).await?;
+        let entity = self.get_or_create_entity(args.entity_id);
+        Ok(RegisteredEntity {
+            entity,
+            registration,
+        })
+    }
     pub fn run(&self) -> impl Future<Output = ()> {
         self.inner.lock().expect("mutex acquisition failed").run()
     }
@@ -244,8 +263,11 @@ impl Runtime {
     }
 }
 
-impl AppRegistrar for Runtime {
-    fn register_app(&self, args: RegisterAppArgs) -> BoxFuture<'_, DiagResult<RegisterAppReply>> {
+impl EntityRegistrar for Runtime {
+    fn register_entity(
+        &self,
+        args: RegisterEntityArgs,
+    ) -> BoxFuture<'_, DiagResult<RegisterEntityReply>> {
         async move {
             let registrar_backend = self
                 .inner
@@ -255,53 +277,57 @@ impl AppRegistrar for Runtime {
                 .clone();
 
             let backend_reply = match registrar_backend {
-                Some(registrar_backend) => Some(registrar_backend.register_app(args.clone()).await?),
+                Some(registrar_backend) => {
+                    Some(registrar_backend.register_entity(args.clone()).await?)
+                }
                 None => None,
             };
 
             self.inner
                 .lock()
                 .map_err(|_| DiagError::mutex_error())?
-                .register_app_locally(args, backend_reply)
+                .register_entity_locally(args, backend_reply)
         }
         .boxed()
     }
 
-    fn deregister_app(&self, args: DeregisterAppArgs) -> BoxFuture<'_, DiagResult<()>> {
+    fn deregister_entity(&self, args: DeregisterEntityArgs) -> BoxFuture<'_, DiagResult<()>> {
         async move {
             let (registrar_backend, resolved_args) = {
                 let runtime = self.inner.lock().map_err(|_| DiagError::mutex_error())?;
-                let resolved_args = DeregisterAppArgs {
+                let resolved_args = DeregisterEntityArgs {
                     registration_id: args
                         .registration_id
                         .clone()
-                        .or_else(|| runtime.registration_id_for(&args.app_id)),
+                        .or_else(|| runtime.registration_id_for(&args.entity_id)),
                     ..args.clone()
                 };
                 (runtime.registrar_backend.clone(), resolved_args)
             };
 
             if let Some(registrar_backend) = registrar_backend {
-                registrar_backend.deregister_app(resolved_args.clone()).await?;
+                registrar_backend
+                    .deregister_entity(resolved_args.clone())
+                    .await?;
             }
 
             self.inner
                 .lock()
                 .map_err(|_| DiagError::mutex_error())?
-                .deregister_app_locally(resolved_args)
+                .deregister_entity_locally(resolved_args)
         }
         .boxed()
     }
 }
 
-impl AppRegistryQuery for Runtime {
-    fn resolve_endpoint(&self, app_id: &str) -> BoxFuture<'_, DiagResult<ReplyMessagePayload>> {
-        let app_id = app_id.to_string();
+impl EntityRegistryQuery for Runtime {
+    fn resolve_endpoint(&self, entity_id: &str) -> BoxFuture<'_, DiagResult<ReplyMessagePayload>> {
+        let entity_id = entity_id.to_string();
         async move {
             self.inner
                 .lock()
                 .map_err(|_| DiagError::mutex_error())?
-                .resolve_endpoint(&app_id)
+                .resolve_endpoint(&entity_id)
         }
         .boxed()
     }
@@ -309,8 +335,8 @@ impl AppRegistryQuery for Runtime {
 
 struct RuntimeImpl {
     entities: Arc<Mutex<IndexMap<EntityId, Arc<Entity>>>>,
-    registrations: IndexMap<String, RegisteredApp>,
-    registrar_backend: Option<Arc<dyn AppRegistrar + Send + Sync>>,
+    registrations: IndexMap<String, RegisteredEntityEndpoint>,
+    registrar_backend: Option<Arc<dyn EntityRegistrar + Send + Sync>>,
     registration_counter: u64,
     sovd_sender: mpsc::Sender<(SOVDMessage, oneshot::Sender<SOVDReply>)>,
     sovd_messages: Option<mpsc::Receiver<(SOVDMessage, oneshot::Sender<SOVDReply>)>>,
@@ -323,12 +349,14 @@ impl RuntimeImpl {
         Self::with_optional_backends(None)
     }
 
-    pub fn with_registrar_backend(registrar_backend: Arc<dyn AppRegistrar + Send + Sync>) -> Self {
+    pub fn with_registrar_backend(
+        registrar_backend: Arc<dyn EntityRegistrar + Send + Sync>,
+    ) -> Self {
         Self::with_optional_backends(Some(registrar_backend))
     }
 
     fn with_optional_backends(
-        registrar_backend: Option<Arc<dyn AppRegistrar + Send + Sync>>,
+        registrar_backend: Option<Arc<dyn EntityRegistrar + Send + Sync>>,
     ) -> Self {
         let (sovd_sender, sovd_receiver) =
             mpsc::channel::<(SOVDMessage, oneshot::Sender<SOVDReply>)>(10);
@@ -555,15 +583,15 @@ impl RuntimeImpl {
             .clone()
     }
 
-    fn register_app_locally(
+    fn register_entity_locally(
         &mut self,
-        args: RegisterAppArgs,
-        backend_reply: Option<RegisterAppReply>,
-    ) -> DiagResult<RegisterAppReply> {
-        if args.app_id.is_empty() {
+        args: RegisterEntityArgs,
+        backend_reply: Option<RegisterEntityReply>,
+    ) -> DiagResult<RegisterEntityReply> {
+        if args.entity_id.is_empty() {
             return Err(DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::IncompleteRequest,
-                "app_id must not be empty".to_string(),
+                "entity_id must not be empty".to_string(),
             )));
         }
 
@@ -574,11 +602,11 @@ impl RuntimeImpl {
             )));
         }
 
-        self.get_or_create_entity(args.app_id.clone());
+        self.get_or_create_entity(args.entity_id.clone());
 
         self.registrations.insert(
-            args.app_id,
-            RegisteredApp {
+            args.entity_id,
+            RegisteredEntityEndpoint {
                 endpoint: args.endpoint,
                 registration_id: backend_reply
                     .as_ref()
@@ -587,42 +615,42 @@ impl RuntimeImpl {
         );
 
         self.registration_counter += 1;
-        Ok(backend_reply.unwrap_or(RegisterAppReply {
+        Ok(backend_reply.unwrap_or(RegisterEntityReply {
             registration_id: Some(format!("reg-{}", self.registration_counter)),
             lease_ms: Some(DEFAULT_REGISTRATION_LEASE_MS),
         }))
     }
 
-    fn deregister_app_locally(&mut self, args: DeregisterAppArgs) -> DiagResult<()> {
-        if self.registrations.shift_remove(&args.app_id).is_none() {
+    fn deregister_entity_locally(&mut self, args: DeregisterEntityArgs) -> DiagResult<()> {
+        if self.registrations.shift_remove(&args.entity_id).is_none() {
             return Err(DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::ErrorResponse,
-                format!("App with id '{}' is not registered", args.app_id),
+                format!("Entity with id '{}' is not registered", args.entity_id),
             )));
         }
 
         self.entities
             .lock()
             .map_err(|_| DiagError::mutex_error())?
-            .shift_remove(&args.app_id);
+            .shift_remove(&args.entity_id);
 
         Ok(())
     }
 
-    fn registration_id_for(&self, app_id: &str) -> Option<String> {
+    fn registration_id_for(&self, entity_id: &str) -> Option<String> {
         self.registrations
-            .get(app_id)
-            .and_then(|registered_app| registered_app.registration_id.clone())
+            .get(entity_id)
+            .and_then(|registered_entity| registered_entity.registration_id.clone())
     }
 
-    fn resolve_endpoint(&self, app_id: &str) -> DiagResult<ReplyMessagePayload> {
+    fn resolve_endpoint(&self, entity_id: &str) -> DiagResult<ReplyMessagePayload> {
         self.registrations
-            .get(app_id)
+            .get(entity_id)
             .map(|entry| ReplyMessagePayload::UTF8(entry.endpoint.clone()))
             .ok_or_else(|| {
                 DiagError::from_error(sovd::GenericError::from_code(
                     sovd::ErrorCode::ErrorResponse,
-                    format!("App with id '{}' is not registered", app_id),
+                    format!("Entity with id '{}' is not registered", entity_id),
                 ))
             })
     }
@@ -729,7 +757,10 @@ impl Entity {
     }
 
     pub fn unregister_operation(&self, op_id: &OperationId) -> DiagResult<()> {
-        let mut operations = self.operations.lock().map_err(|_| DiagError::mutex_error())?;
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|_| DiagError::mutex_error())?;
         let operation = operations.get(op_id).ok_or_else(|| {
             DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::ErrorResponse,
@@ -816,7 +847,10 @@ impl Entity {
         op_id: &OperationId,
         timeout: Option<ExecutionTimeout>,
     ) -> DiagResult<ExecutionId> {
-        let mut operations = self.operations.lock().map_err(|_| DiagError::mutex_error())?;
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|_| DiagError::mutex_error())?;
         let operation = operations.get_mut(op_id).ok_or_else(|| {
             DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::ErrorResponse,
@@ -888,7 +922,10 @@ impl Entity {
             );
             drop(operations); // for unlocking the mutex
             let result = futures::executor::block_on(exec_future_with_timeout);
-            let mut operations = self.operations.lock().map_err(|_| DiagError::mutex_error())?;
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|_| DiagError::mutex_error())?;
             let operation = operations.get_mut(op_id).expect("operation must exist");
             if let Some(execution) = operation.executions.get_mut(&exec_id) {
                 *execution = ActiveExecution::Completed(result);
@@ -911,7 +948,10 @@ impl Entity {
         op_id: &OperationId,
         exec_id: &ExecutionId,
     ) -> DiagResult<mpsc::Sender<ExecutionEvent>> {
-        let operations = self.operations.lock().map_err(|_| DiagError::mutex_error())?;
+        let operations = self
+            .operations
+            .lock()
+            .map_err(|_| DiagError::mutex_error())?;
         let operation = operations.get(op_id).ok_or_else(|| {
             DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::ErrorResponse,
@@ -938,7 +978,10 @@ impl Entity {
         op_id: &OperationId,
         exec_id: &ExecutionId,
     ) -> DiagResult<ExecutionResult> {
-        let mut operations = self.operations.lock().map_err(|_| DiagError::mutex_error())?;
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|_| DiagError::mutex_error())?;
         let operation = operations.get_mut(op_id).ok_or_else(|| {
             DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::ErrorResponse,
@@ -962,7 +1005,10 @@ impl Entity {
     }
 
     pub fn remove_execution(&self, op_id: &OperationId, exec_id: &ExecutionId) -> DiagResult<()> {
-        let mut operations = self.operations.lock().map_err(|_| DiagError::mutex_error())?;
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|_| DiagError::mutex_error())?;
         let operation = operations.get_mut(op_id).ok_or_else(|| {
             DiagError::from_error(sovd::GenericError::from_code(
                 sovd::ErrorCode::ErrorResponse,
@@ -1064,21 +1110,21 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingRegistrar {
-        registered: StdMutex<Vec<RegisterAppArgs>>,
-        deregistered: StdMutex<Vec<DeregisterAppArgs>>,
+        registered: StdMutex<Vec<RegisterEntityArgs>>,
+        deregistered: StdMutex<Vec<DeregisterEntityArgs>>,
     }
 
-    impl AppRegistrar for RecordingRegistrar {
-        fn register_app(
+    impl EntityRegistrar for RecordingRegistrar {
+        fn register_entity(
             &self,
-            args: RegisterAppArgs,
-        ) -> BoxFuture<'_, DiagResult<RegisterAppReply>> {
+            args: RegisterEntityArgs,
+        ) -> BoxFuture<'_, DiagResult<RegisterEntityReply>> {
             self.registered
                 .lock()
                 .expect("lock should succeed")
                 .push(args);
             async move {
-                Ok(RegisterAppReply {
+                Ok(RegisterEntityReply {
                     registration_id: Some("backend-reg-1".to_string()),
                     lease_ms: Some(45_000),
                 })
@@ -1086,7 +1132,7 @@ mod tests {
             .boxed()
         }
 
-        fn deregister_app(&self, args: DeregisterAppArgs) -> BoxFuture<'_, DiagResult<()>> {
+        fn deregister_entity(&self, args: DeregisterEntityArgs) -> BoxFuture<'_, DiagResult<()>> {
             self.deregistered
                 .lock()
                 .expect("lock should succeed")
@@ -1099,19 +1145,23 @@ mod tests {
     async fn runtime_register_and_resolve_endpoint() {
         let runtime = Runtime::new();
 
-        let reply = runtime
-            .register_app(RegisterAppArgs {
-                app_id: "APP01".to_string(),
-                app_name: "Diagnostics App".to_string(),
-                hosted_on: "HPC".to_string(),
+        let registered = runtime
+            .register_entity_facade(RegisterEntityArgs {
+                entity_id: "APP01".to_string(),
+                entity_name: "Diagnostics App".to_string(),
+                hosting_component: Some("HPC".to_string()),
                 endpoint: "http://127.0.0.1:8081/api".to_string(),
                 additional_attrs: None,
             })
             .await
             .expect("registration should succeed");
 
-        assert_eq!(reply.lease_ms, Some(DEFAULT_REGISTRATION_LEASE_MS));
-        assert!(reply.registration_id.is_some());
+        assert_eq!(
+            registered.registration.lease_ms,
+            Some(DEFAULT_REGISTRATION_LEASE_MS)
+        );
+        assert!(registered.registration.registration_id.is_some());
+        assert!(Arc::strong_count(&registered.entity) >= 2);
 
         let endpoint = runtime
             .resolve_endpoint("APP01")
@@ -1128,10 +1178,10 @@ mod tests {
         let runtime = Runtime::new();
 
         runtime
-            .register_app(RegisterAppArgs {
-                app_id: "APP02".to_string(),
-                app_name: "Telemetry App".to_string(),
-                hosted_on: "HPC".to_string(),
+            .register_entity(RegisterEntityArgs {
+                entity_id: "APP02".to_string(),
+                entity_name: "Telemetry App".to_string(),
+                hosting_component: Some("HPC".to_string()),
                 endpoint: "http://127.0.0.1:8082/api".to_string(),
                 additional_attrs: None,
             })
@@ -1139,8 +1189,8 @@ mod tests {
             .expect("registration should succeed");
 
         runtime
-            .deregister_app(DeregisterAppArgs {
-                app_id: "APP02".to_string(),
+            .deregister_entity(DeregisterEntityArgs {
+                entity_id: "APP02".to_string(),
                 registration_id: None,
             })
             .await
@@ -1160,15 +1210,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_register_app_forwards_to_open_sovd_backend() {
+    async fn runtime_register_entity_forwards_to_open_sovd_backend() {
         let registrar = Arc::new(RecordingRegistrar::default());
         let runtime = Runtime::with_registrar_backend(registrar.clone());
 
         let reply = runtime
-            .register_app(RegisterAppArgs {
-                app_id: "APP03".to_string(),
-                app_name: "Proxy App".to_string(),
-                hosted_on: "HPC".to_string(),
+            .register_entity(RegisterEntityArgs {
+                entity_id: "APP03".to_string(),
+                entity_name: "Proxy App".to_string(),
+                hosting_component: Some("HPC".to_string()),
                 endpoint: "http://127.0.0.1:8083/api".to_string(),
                 additional_attrs: None,
             })
@@ -1177,21 +1227,21 @@ mod tests {
 
         let registered = registrar.registered.lock().expect("lock should succeed");
         assert_eq!(registered.len(), 1);
-        assert_eq!(registered[0].app_id, "APP03");
+        assert_eq!(registered[0].entity_id, "APP03");
         assert_eq!(reply.registration_id, Some("backend-reg-1".to_string()));
         assert_eq!(reply.lease_ms, Some(45_000));
     }
 
     #[tokio::test]
-    async fn runtime_deregister_app_forwards_to_open_sovd_backend() {
+    async fn runtime_deregister_entity_forwards_to_open_sovd_backend() {
         let registrar = Arc::new(RecordingRegistrar::default());
         let runtime = Runtime::with_registrar_backend(registrar.clone());
 
         runtime
-            .register_app(RegisterAppArgs {
-                app_id: "APP04".to_string(),
-                app_name: "Proxy App".to_string(),
-                hosted_on: "HPC".to_string(),
+            .register_entity(RegisterEntityArgs {
+                entity_id: "APP04".to_string(),
+                entity_name: "Proxy App".to_string(),
+                hosting_component: Some("HPC".to_string()),
                 endpoint: "http://127.0.0.1:8084/api".to_string(),
                 additional_attrs: None,
             })
@@ -1199,8 +1249,8 @@ mod tests {
             .expect("registration should succeed");
 
         runtime
-            .deregister_app(DeregisterAppArgs {
-                app_id: "APP04".to_string(),
+            .deregister_entity(DeregisterEntityArgs {
+                entity_id: "APP04".to_string(),
                 registration_id: None,
             })
             .await
@@ -1208,18 +1258,21 @@ mod tests {
 
         let deregistered = registrar.deregistered.lock().expect("lock should succeed");
         assert_eq!(deregistered.len(), 1);
-        assert_eq!(deregistered[0].app_id, "APP04");
-        assert_eq!(deregistered[0].registration_id, Some("backend-reg-1".to_string()));
+        assert_eq!(deregistered[0].entity_id, "APP04");
+        assert_eq!(
+            deregistered[0].registration_id,
+            Some("backend-reg-1".to_string())
+        );
     }
 
     #[test]
     fn runtime_unregister_entity_removes_entity_and_registration() {
         let runtime = Runtime::new();
 
-        futures::executor::block_on(runtime.register_app(RegisterAppArgs {
-            app_id: "APP_UNREGISTER".to_string(),
-            app_name: "Unregister App".to_string(),
-            hosted_on: "HPC".to_string(),
+        futures::executor::block_on(runtime.register_entity(RegisterEntityArgs {
+            entity_id: "APP_UNREGISTER".to_string(),
+            entity_name: "Unregister App".to_string(),
+            hosting_component: Some("HPC".to_string()),
             endpoint: "http://127.0.0.1:8086/api".to_string(),
             additional_attrs: None,
         }))
@@ -1262,7 +1315,10 @@ mod tests {
             .expect("resource unregister should succeed");
 
         let err = entity
-            .read_data_resource(&resource_id, ReadValueArgs::from(ReplyMessageEncoding::UTF8))
+            .read_data_resource(
+                &resource_id,
+                ReadValueArgs::from(ReplyMessageEncoding::UTF8),
+            )
             .expect_err("read should fail after unregister");
 
         match err.code {

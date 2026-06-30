@@ -30,7 +30,7 @@ pub mod uds {
 pub mod sovd {
     pub use common::sovd::*;
 
-    pub use app_registration::AppRegistrar; // for users' convenience
+    pub use app_registration::EntityRegistrar; // for users' convenience
 
     pub mod app_registration {
         pub use app_registration::*;
